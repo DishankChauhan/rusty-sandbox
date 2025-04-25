@@ -1,0 +1,93 @@
+Building RustySandbox...
+
+
+--- BASIC FUNCTIONALITY TESTS ---
+
+
+Running safe Python example:
+Running file: "examples/hello.py"
+Memory limit: 512 MB
+CPU limit: 5 seconds
+Timeout: 10 seconds
+Exit status: 0
+Stdout: Hello from the RustySandbox!
+This is a safe Python script.
+Fibonacci sequence: [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+Adding 1: total is now 1
+Adding 2: total is now 3
+Adding 3: total is now 6
+Adding 4: total is now 10
+Adding 5: total is now 15
+
+
+Execution completed in 0.04 seconds
+
+
+Running dangerous Python example (should be caught by linter):
+Running file: "examples/dangerous.py"
+Memory limit: 512 MB
+CPU limit: 5 seconds
+Timeout: 10 seconds
+
+
+Running JavaScript example:
+Running file: "examples/hello.js"
+Memory limit: 512 MB
+CPU limit: 5 seconds
+Timeout: 10 seconds
+
+
+--- RESOURCE LIMIT TESTS ---
+
+
+Running with custom resource limits (verbose):
+Running file: "examples/hello.py"
+Memory limit: 256 MB
+CPU limit: 3 seconds
+Timeout: 5 seconds
+Verbose mode enabled
+Exit status: 0
+Stdout: Hello from the RustySandbox!
+This is a safe Python script.
+Fibonacci sequence: [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+Adding 1: total is now 1
+Adding 2: total is now 3
+Adding 3: total is now 6
+Adding 4: total is now 10
+Adding 5: total is now 15
+
+
+Execution completed in 0.02 seconds
+CPU time used: 0.02 seconds
+
+
+Running CPU-intensive test with tight CPU limit (should hit limit or take a while):
+Running file: "test_output/cpu_intensive.py"
+Memory limit: 512 MB
+CPU limit: 2 seconds
+Timeout: 10 seconds
+Verbose mode enabled
+Exit status: 0
+Stdout: Fibonacci(35) = 9227465
+
+
+Execution completed in 0.94 seconds
+CPU time used: 0.93 seconds
+
+
+Running memory-intensive test with tight memory limit:
+Running file: "test_output/memory_intensive.py"
+Memory limit: 100 MB
+CPU limit: 5 seconds
+Timeout: 10 seconds
+Verbose mode enabled
+Exit status: 0
+Stdout: Allocated list of size 78643200
+
+
+Execution completed in 0.44 seconds
+CPU time used: 0.44 seconds
+
+
+All tests complete!
+Cleaning up test files...
