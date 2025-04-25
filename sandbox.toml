@@ -1,0 +1,46 @@
+# Rusty Sandbox Configuration
+
+[general]
+working_dir = "./workspace"
+tmp_dir = "./tmp"
+log_level = "info"
+
+[resource_limits]
+memory_limit_mb = 512
+cpu_time_limit_s = 5
+timeout_s = 10
+max_processes = 10
+max_file_size_kb = 5120  # 5MB
+max_open_files = 20
+
+[security]
+enable_network = false
+allowed_paths = [
+    "./examples",
+    "./workspace"
+]
+
+# Runtime-specific configurations
+
+[runtimes.python]
+interpreter = "python3"
+extra_args = "--no-site-packages"
+packages_dir = "./python_packages"
+
+[runtimes.javascript]
+runtime = "node"
+extra_args = "--no-warnings"
+modules_dir = "./node_modules"
+
+[runtimes.wasm]
+wasi_enabled = true
+max_memory_pages = 100  # 6.4MB (64KB * 100)
+stack_size = 65536      # 64KB
+allow_bulk_memory = true
+
+# Custom extension mappings
+[runtimes.extensions]
+# For example, to use the Python executor for .pyw files
+"pyw" = "python"
+# Or to use the JavaScript executor for .mjs files
+"mjs" = "javascript" 

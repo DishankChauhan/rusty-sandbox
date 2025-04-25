@@ -80,12 +80,13 @@ pub struct SandboxConfig {
     pub timeout_s: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SandboxResult {
     pub exit_status: i32,
     pub stdout: String,
     pub stderr: String,
     pub execution_time: Duration,
+    pub peak_memory_kb: Option<u64>,
 }
 
 pub async fn run_sandboxed(config: SandboxConfig) -> Result<SandboxResult, SandboxError> {
@@ -195,6 +196,7 @@ async fn run_sandboxed_linux(
                                 stdout: stdout_content,
                                 stderr: stderr_content,
                                 execution_time: start.elapsed(),
+                                peak_memory_kb: Some(0),
                             });
                         }
                         Ok(WaitStatus::Signaled(_, signal, _)) => {
@@ -213,6 +215,7 @@ async fn run_sandboxed_linux(
                                 stdout: stdout_content,
                                 stderr: stderr_content,
                                 execution_time: start.elapsed(),
+                                peak_memory_kb: Some(0),
                             });
                         }
                         Err(e) => {
@@ -260,23 +263,6 @@ async fn run_sandboxed_linux(
 }
 
 #[cfg(all(feature = "linux", target_os = "linux"))]
-fn apply_linux_security_features(config: &SandboxConfig) -> Result<(), SandboxError> {
-    // Set resource limits first (must be done before dropping privileges)
-    set_resource_limits_linux(config.memory_limit_mb, config.cpu_time_limit_s)?;
-    
-    // Create new namespaces for isolation
-    create_namespaces()?;
-    
-    // Change root to temporary directory for filesystem isolation
-    // This would be implemented here in a full version
-    
-    // Apply seccomp filter to restrict syscalls
-    apply_seccomp_filter()?;
-    
-    Ok(())
-}
-
-#[cfg(not(all(feature = "linux", target_os = "linux")))]
 async fn run_sandboxed_portable(
     config: SandboxConfig,
     temp_file_path: PathBuf,
@@ -434,6 +420,7 @@ async fn run_sandboxed_portable(
                     stdout,
                     stderr: combined_stderr,
                     execution_time: elapsed,
+                    peak_memory_kb: None,
                 });
             }
             
@@ -447,6 +434,7 @@ async fn run_sandboxed_portable(
                 stdout,
                 stderr,
                 execution_time: elapsed,
+                peak_memory_kb: None,
             })
         }
         Ok(Err(e)) => {
@@ -691,4 +679,21 @@ fn execute_program(file_path: &PathBuf, file_type: FileType) -> Result<(), Sandb
         .to_string();
     
     Err(SandboxError::ExecutionError(error))
+}
+
+#[cfg(all(feature = "linux", target_os = "linux"))]
+fn apply_linux_security_features(config: &SandboxConfig) -> Result<(), SandboxError> {
+    // Set resource limits first (must be done before dropping privileges)
+    set_resource_limits_linux(config.memory_limit_mb, config.cpu_time_limit_s)?;
+    
+    // Create new namespaces for isolation
+    create_namespaces()?;
+    
+    // Change root to temporary directory for filesystem isolation
+    // This would be implemented here in a full version
+    
+    // Apply seccomp filter to restrict syscalls
+    apply_seccomp_filter()?;
+    
+    Ok(())
 } 

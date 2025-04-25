@@ -1,130 +1,146 @@
-# RustySandbox
+# 🛡️ Rusty Sandbox
 
-A secure sandbox for executing untrusted code written in Rust.
+A secure sandbox for executing untrusted code, implemented in Rust.
 
-## Overview
+## 🚀 Features
 
-RustySandbox is a security-focused tool designed to safely execute untrusted code snippets. It isolates execution using Linux security features like namespaces, seccomp filters, and resource limits to prevent harmful system interactions.
+- **Secure Execution**: Run untrusted code with strong isolation
+- **Resource Limits**: Restrict memory, CPU, and file system usage
+- **Multi-language Support**: Execute Python, JavaScript, and WebAssembly code
+- **Plugin Architecture**: Easily extend with support for additional languages
+- **Configuration System**: Customize sandbox behavior through a flexible configuration file
 
-### Current Features (Phase 1: MVP)
+## 📋 Supported Languages
 
-- Execute untrusted Python and JavaScript code securely through a CLI
-- Isolate execution using Linux namespaces (process, network isolation)
-- Limit resources (CPU, memory, processes, file size) using rlimit
-- Restrict dangerous system calls using seccomp filters with a fine-grained policy
-- Real-time resource monitoring with detailed usage statistics
-- Static code analysis to detect potentially dangerous patterns
-- Cross-platform compatibility with enhanced features on Linux
-- Capture and report stdout, stderr, and exit status
+- **Python** (`.py` files)
+- **JavaScript** (`.js` files)
+- **WebAssembly** (`.wasm` files)
 
-## Prerequisites
-
-- Linux operating system (for full security features)
-- macOS or other platforms (basic functionality without isolation)
-- Rust 1.56+ with Cargo
-- Python 3.x and/or Node.js (depending on which code you want to execute)
-
-⚠️ **IMPORTANT**: Security and resource limitation features vary significantly by platform. Please read the [Platform-Specific Notes](PLATFORM_NOTES.md) document for details about cross-platform differences.
-
-## Building from Source
+## 📦 Installation
 
 ```bash
-git clone https://github.com/yourusername/rusty-sandbox.git
+# Clone the repository
+git clone https://github.com/your-username/rusty-sandbox.git
 cd rusty-sandbox
+
+# Build the project
 cargo build --release
+
+# Install (optional)
+cargo install --path .
 ```
 
-The compiled binary will be in `./target/release/rusty-sandbox`.
+## 🔧 Usage
 
-## Usage
-
-### Execute a Python file:
+### Basic Usage
 
 ```bash
-rusty-sandbox run path/to/file.py
+# Run a Python file
+rusty-sandbox run examples/hello.py
+
+# Run a JavaScript file
+rusty-sandbox run examples/hello.js
+
+# Run a WebAssembly file
+rusty-sandbox run examples/hello.wasm
+
+# List supported file types
+rusty-sandbox list-supported
 ```
 
-### Execute a JavaScript file:
+### Custom Resource Limits
 
 ```bash
-rusty-sandbox run path/to/file.js
+# Override memory limit (in MB)
+rusty-sandbox run examples/hello.py --memory-limit 256
+
+# Override CPU time limit (in seconds)
+rusty-sandbox run examples/hello.py --cpu-limit 2
+
+# Override execution timeout (in seconds)
+rusty-sandbox run examples/hello.py --timeout 5
 ```
 
-### Set custom limits:
+### Custom Configuration
 
 ```bash
-rusty-sandbox run path/to/file.py --memory-limit 256 --cpu-limit 3 --timeout 5
+# Use a custom configuration file
+rusty-sandbox --config my-sandbox.toml run examples/hello.py
 ```
 
-### Enable verbose output:
+## ⚙️ Configuration
 
-```bash
-rusty-sandbox run path/to/file.py --verbose
+Rusty Sandbox uses a TOML configuration file (`sandbox.toml`) for customization. The configuration file can be placed in:
+
+- Current directory (`./sandbox.toml`)
+- Config directory (`./config/sandbox.toml`)
+- User config directory (`~/.config/rusty-sandbox/sandbox.toml`)
+
+### Example Configuration
+
+```toml
+# Rusty Sandbox Configuration
+
+[general]
+working_dir = "./workspace"
+tmp_dir = "./tmp"
+log_level = "info"
+
+[resource_limits]
+memory_limit_mb = 512
+cpu_time_limit_s = 5
+timeout_s = 10
+max_processes = 10
+max_file_size_kb = 5120  # 5MB
+max_open_files = 20
+
+[security]
+enable_network = false
+allowed_paths = [
+    "./examples",
+    "./workspace"
+]
+
+# Runtime-specific configurations
+[runtimes.python]
+interpreter = "python3"
+extra_args = "--no-site-packages"
+
+[runtimes.javascript]
+runtime = "node"
+extra_args = "--no-warnings"
+
+[runtimes.wasm]
+wasi_enabled = true
+max_memory_pages = 100  # 6.4MB
 ```
 
-## Platform-Specific Recommendations
+## 🔌 Plugin Architecture
 
-For consistent behavior across different operating systems:
+Rusty Sandbox uses a plugin-based architecture for language support. Each language is implemented as a `RuntimeExecutor` that can be registered with the system.
 
-- **Linux**: Full security features available
-- **macOS/Windows**: Set conservative memory limits (20% below actual requirement)
+To add support for a new language:
 
-See [Platform-Specific Notes](PLATFORM_NOTES.md) for detailed recommendations.
+1. Implement the `RuntimeExecutor` trait
+2. Register the executor with the `RuntimeRegistry`
+3. Add appropriate configurations to the `sandbox.toml` file
 
-## Security Features
+## 🔒 Security
 
-- **Linux Namespaces**: Isolates processes using user, PID, network, mount, and IPC namespaces
-- **Seccomp Filters**: Restricts system calls to a minimal safe set with BPF filtering
-- **Resource Limits**: Prevents resource exhaustion attacks with:
-  - Memory limits (both for Linux and language runtime specific)
-  - CPU time constraints
-  - Process count restrictions
-  - File size limitations
-  - Execution timeout enforcement
-- **Static Analysis**: Detects potentially dangerous code patterns with regex-based linting
-- **Temporary Execution**: All code runs in temporary isolated directories
-- **Real-time Monitoring**: Tracks resource usage throughout execution
+Rusty Sandbox provides multiple layers of security:
 
-## Implementation Details
+- **Resource Limits**: Restrict memory usage, CPU time, file descriptors, etc.
+- **Code Linting**: Detect potentially dangerous code patterns before execution
+- **Sandboxing**: Use OS-level isolation mechanisms (seccomp, namespaces, etc. on Linux)
+- **Execution Timeout**: Automatically terminate long-running processes
+- **File System Isolation**: Restrict access to the file system
 
-### Seccomp Filter Implementation
-The sandbox implements a seccomp filter that allows only necessary system calls for code execution, blocking all potentially dangerous calls.
+## 📝 License
 
-### Namespace Implementation
-Multiple Linux namespaces are used to isolate the execution environment:
-- User namespace for UID/GID mapping
-- PID namespace for process isolation
-- Network namespace to restrict network access
-- Mount namespace for filesystem isolation
-- IPC namespace for resource isolation
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-### Resource Monitoring
-Real-time monitoring of:
-- Memory usage (peak and average)
-- CPU time (user and system)
-- Execution time statistics
+## 🔗 Related Projects
 
-## Development Roadmap
-
-### Phase 1: MVP (Completed)
-- CLI tool for executing Python and JS snippets securely
-- Basic resource constraints
-- Process isolation
-- Static code analysis
-- Real-time resource monitoring
-
-### Future Plans
-- Enhanced seccomp profiles for different languages
-- Support for more languages (Rust, Go, etc.)
-- Network sandboxing with fine-grained control
-- Web API for remote code execution
-- Detailed resource usage metrics and visualization
-- Containerization support via integration with Docker/OCI runtime
-
-## License
-
-MIT
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+- [Wasmtime](https://wasmtime.dev/) - Used for WebAssembly execution
+- [Seccomp](https://en.wikipedia.org/wiki/Seccomp) - Linux kernel security feature for sandboxing
+- [WASI](https://wasi.dev/) - WebAssembly System Interface
