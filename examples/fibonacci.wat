@@ -35,20 +35,14 @@
     
     ;; Iterate to calculate fibonacci
     (loop $fib_loop
-      (br_if $fib_loop
-        (i32.lt_s 
-          (then
-            ;; Compute next value
-            (local.set $temp (local.get $curr))
-            (local.set $curr (i32.add (local.get $prev) (local.get $curr)))
-            (local.set $prev (local.get $temp))
-            ;; Increment counter
-            (local.set $i (i32.add (local.get $i) (i32.const 1)))
-            ;; Continue if i < n
-            (i32.lt_s (local.get $i) (local.get $n))
-          )
-        )
-      )
+      ;; Compute next value
+      (local.set $temp (local.get $curr))
+      (local.set $curr (i32.add (local.get $prev) (local.get $curr)))
+      (local.set $prev (local.get $temp))
+      ;; Increment counter
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      ;; Continue if i < n
+      (br_if $fib_loop (i32.lt_s (local.get $i) (local.get $n)))
     )
     
     ;; Return result
@@ -100,20 +94,17 @@
     
     ;; Convert each digit
     (loop $digit_loop
-      (br_if $digit_loop
-        (i32.gt_s (local.get $temp) (i32.const 0))
-        (then
-          ;; Calculate remainder
-          (local.set $remainder (i32.rem_u (local.get $temp) (i32.const 10)))
-          ;; Convert to ASCII and store
-          (local.set $digit_char (i32.add (local.get $remainder) (i32.const 48)))
-          (i32.store8 (local.get $current_pos) (local.get $digit_char))
-          ;; Move to next position and update value
-          (local.set $current_pos (i32.add (local.get $current_pos) (i32.const 1)))
-          (local.set $temp (i32.div_u (local.get $temp) (i32.const 10)))
-          (local.set $digit_count (i32.add (local.get $digit_count) (i32.const 1)))
-        )
-      )
+      ;; Calculate remainder
+      (local.set $remainder (i32.rem_u (local.get $temp) (i32.const 10)))
+      ;; Convert to ASCII and store
+      (local.set $digit_char (i32.add (local.get $remainder) (i32.const 48)))
+      (i32.store8 (local.get $current_pos) (local.get $digit_char))
+      ;; Move to next position and update value
+      (local.set $current_pos (i32.add (local.get $current_pos) (i32.const 1)))
+      (local.set $temp (i32.div_u (local.get $temp) (i32.const 10)))
+      (local.set $digit_count (i32.add (local.get $digit_count) (i32.const 1)))
+      ;; Continue if temp > 0
+      (br_if $digit_loop (i32.gt_s (local.get $temp) (i32.const 0)))
     )
     
     ;; Return the number of digits written
@@ -134,47 +125,45 @@
     (local.set $i (i32.const 0))
     
     (loop $fib_print_loop
-      (br_if $fib_print_loop
-        (i32.lt_s (local.get $i) (i32.const 20))
-        (then
-          ;; Calculate Fibonacci number
-          (local.set $fib_value (call $fibonacci (local.get $i)))
-          
-          ;; Format the output string at position 100
-          (local.set $buffer_pos (i32.const 100))
-          
-          ;; Format "fib(i) = value"
-          ;; Copy "fib(" part
-          (i32.store (local.get $buffer_pos) (i32.load (i32.const 20)))
-          (i32.store (i32.add (local.get $buffer_pos) (i32.const 4)) (i32.load (i32.const 24)))
-          
-          ;; Add index value after "fib("
-          (local.set $buffer_pos (i32.add (local.get $buffer_pos) (i32.const 4)))
-          (local.set $len (call $format_int (local.get $i) (local.get $buffer_pos)))
-          (local.set $buffer_pos (i32.add (local.get $buffer_pos) (local.get $len)))
-          
-          ;; Add ") = " part
-          (i32.store8 (local.get $buffer_pos) (i32.const 41)) ;; ')'
-          (i32.store8 (i32.add (local.get $buffer_pos) (i32.const 1)) (i32.const 32)) ;; ' '
-          (i32.store8 (i32.add (local.get $buffer_pos) (i32.const 2)) (i32.const 61)) ;; '='
-          (i32.store8 (i32.add (local.get $buffer_pos) (i32.const 3)) (i32.const 32)) ;; ' '
-          (local.set $buffer_pos (i32.add (local.get $buffer_pos) (i32.const 4)))
-          
-          ;; Add the fibonacci value
-          (local.set $len (call $format_int (local.get $fib_value) (local.get $buffer_pos)))
-          (local.set $buffer_pos (i32.add (local.get $buffer_pos) (local.get $len)))
-          
-          ;; Add newline
-          (i32.store8 (local.get $buffer_pos) (i32.const 10)) ;; '\n'
-          (local.set $buffer_pos (i32.add (local.get $buffer_pos) (i32.const 1)))
-          
-          ;; Print the formatted string
-          (call $print_str (i32.const 100) (i32.sub (local.get $buffer_pos) (i32.const 100)))
-          
-          ;; Increment counter
-          (local.set $i (i32.add (local.get $i) (i32.const 1)))
-        )
-      )
+      ;; Calculate Fibonacci number
+      (local.set $fib_value (call $fibonacci (local.get $i)))
+      
+      ;; Format the output string at position 100
+      (local.set $buffer_pos (i32.const 100))
+      
+      ;; Format "fib(i) = value"
+      ;; Copy "fib(" part
+      (i32.store (local.get $buffer_pos) (i32.load (i32.const 20)))
+      (i32.store (i32.add (local.get $buffer_pos) (i32.const 4)) (i32.load (i32.const 24)))
+      
+      ;; Add index value after "fib("
+      (local.set $buffer_pos (i32.add (local.get $buffer_pos) (i32.const 4)))
+      (local.set $len (call $format_int (local.get $i) (local.get $buffer_pos)))
+      (local.set $buffer_pos (i32.add (local.get $buffer_pos) (local.get $len)))
+      
+      ;; Add ") = " part
+      (i32.store8 (local.get $buffer_pos) (i32.const 41)) ;; ')'
+      (i32.store8 (i32.add (local.get $buffer_pos) (i32.const 1)) (i32.const 32)) ;; ' '
+      (i32.store8 (i32.add (local.get $buffer_pos) (i32.const 2)) (i32.const 61)) ;; '='
+      (i32.store8 (i32.add (local.get $buffer_pos) (i32.const 3)) (i32.const 32)) ;; ' '
+      (local.set $buffer_pos (i32.add (local.get $buffer_pos) (i32.const 4)))
+      
+      ;; Add the fibonacci value
+      (local.set $len (call $format_int (local.get $fib_value) (local.get $buffer_pos)))
+      (local.set $buffer_pos (i32.add (local.get $buffer_pos) (local.get $len)))
+      
+      ;; Add newline
+      (i32.store8 (local.get $buffer_pos) (i32.const 10)) ;; '\n'
+      (local.set $buffer_pos (i32.add (local.get $buffer_pos) (i32.const 1)))
+      
+      ;; Print the formatted string
+      (call $print_str (i32.const 100) (i32.sub (local.get $buffer_pos) (i32.const 100)))
+      
+      ;; Increment counter
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      
+      ;; Continue if i < 20
+      (br_if $fib_print_loop (i32.lt_s (local.get $i) (i32.const 20)))
     )
     
     ;; Print footer

@@ -262,12 +262,16 @@ async fn run_sandboxed_linux(
     }
 }
 
-#[cfg(all(feature = "linux", target_os = "linux"))]
+#[cfg(not(all(feature = "linux", target_os = "linux")))]
 async fn run_sandboxed_portable(
     config: SandboxConfig,
     temp_file_path: PathBuf,
     _temp_dir: tempfile::TempDir,
 ) -> Result<SandboxResult, SandboxError> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    use tokio::time::timeout;
+    
     info!("Running in portable mode (without Linux-specific security features)");
     
     #[cfg(target_os = "macos")]
@@ -288,47 +292,11 @@ async fn run_sandboxed_portable(
     
     // Apply memory limits using environment variables
     // This is platform-independent and works with many language runtimes
-    if config.memory_limit_mb > 0 {
-        // For Python (uses PYTHONMEMORY)
-        if let FileType::Python = config.file_type {
-            // More aggressive memory limitation - use 90% of the requested limit
-            // to account for interpreter overhead
-            let memory_bytes = (config.memory_limit_mb as f64 * 0.9) as u64 * 1024 * 1024;
-            command.env("PYTHONMEMORY", memory_bytes.to_string());
-            
-            // Also set a lower memory limit for third-party libraries that respect it
-            command.env("MALLOC_ARENA_MAX", "2"); // Limit memory arenas
-            
-            // MacOS specific memory tuning
-            #[cfg(target_os = "macos")]
-            {
-                // Some additional MacOS-specific environment variables that can help limit memory
-                command.env("PYTHONMALLOCSTATS", "1"); // Enable memory statistics
-                command.env("PYTHONMALLOC", "debug"); // More careful memory allocator
-            }
-        }
-        
-        // For Node.js (uses --max-old-space-size)
-        if let FileType::JavaScript = config.file_type {
-            command = Command::new("node");
-            
-            // Apply 80% of the memory limit to leave room for JavaScript runtime overhead
-            // This is more conservative than the previous approach
-            let adjusted_limit = (config.memory_limit_mb as f64 * 0.8) as u64;
-            command.arg(format!("--max-old-space-size={}", adjusted_limit));
-            
-            // Add additional Node.js memory constraints
-            command.env("NODE_OPTIONS", format!("--max-old-space-size={}", adjusted_limit));
-            
-            // The actual script path comes after the memory arguments
-            command.arg(&temp_file_path);
-        }
-    }
+    command.env("NODE_OPTIONS", format!("--max-old-space-size={}", config.memory_limit_mb));
+    command.env("PYTHONMALLOC", "malloc");
     
-    // Create a child process
-    let mut child = tokio::process::Command::from(command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    // Spawn the process
+    let mut child = command
         .spawn()
         .map_err(|e| SandboxError::ExecutionError(format!("Failed to spawn process: {}", e)))?;
     
@@ -339,138 +307,125 @@ async fn run_sandboxed_portable(
     
     // Set up memory monitoring task
     let memory_limit = config.memory_limit_mb;
-    let timeout_s = config.timeout_s;
-    let memory_monitor = tokio::task::spawn(async move {
+    let memory_monitor_handle = tokio::task::spawn(async move {
         let check_interval = Duration::from_millis(100);
         let mut peak_memory = 0;
-        let start = Instant::now();
         
-        while start.elapsed() < Duration::from_secs(timeout_s) {
-            // Sleep briefly before checking
+        loop {
             tokio::time::sleep(check_interval).await;
             
-            // Check memory usage
+            // Check memory usage using OS-specific methods
             #[cfg(target_os = "macos")]
-            if let Some(memory_mb) = get_macos_memory_usage(pid) {
-                // Track peak memory usage
-                if memory_mb > peak_memory {
-                    peak_memory = memory_mb;
-                }
-                
-                // If over limit, kill the process
-                if memory_mb > memory_limit {
-                    info!("Process exceeded memory limit: {}MB > {}MB - terminating", memory_mb, memory_limit);
+            {
+                if let Ok(memory) = resources::get_memory_usage_macos(pid) {
+                    peak_memory = peak_memory.max(memory);
                     
-                    // On macOS, send SIGTERM first for clean shutdown, then SIGKILL if needed
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
-                        
-                        // Give it a short time to terminate gracefully
-                        tokio::time::sleep(Duration::from_millis(300)).await;
-                        
-                        // Check if still running, then send SIGKILL
-                        if libc::kill(pid as i32, 0) == 0 {
-                            libc::kill(pid as i32, libc::SIGKILL);
-                        }
+                    // Check if exceeding limit
+                    if memory > memory_limit * 1024 {
+                        return Err(SandboxError::MemoryLimitExceeded(memory / 1024, memory_limit));
                     }
-                    
-                    return (true, memory_mb, peak_memory); // Process was terminated due to memory limit
+                } else {
+                    // Process may have ended
+                    break;
                 }
             }
             
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
             {
-                // Simple sleep on other platforms (less aggressive monitoring)
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                if let Ok(memory) = resources::get_memory_usage_linux(pid) {
+                    peak_memory = peak_memory.max(memory);
+                    
+                    // Check if exceeding limit
+                    if memory > memory_limit * 1024 {
+                        return Err(SandboxError::MemoryLimitExceeded(memory / 1024, memory_limit));
+                    }
+                } else {
+                    // Process may have ended
+                    break;
+                }
+            }
+            
+            // Generic fallback for other platforms
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                // Just break the loop on unsupported platforms
+                break;
             }
         }
         
-        (false, 0, peak_memory) // No memory limit reached
+        Ok(peak_memory)
     });
     
-    // Execute with timeout
+    // Wait for the process with timeout
     let timeout_duration = Duration::from_secs(config.timeout_s);
     
-    // Wait for process to complete or timeout
-    let timeout_result = tokio::time::timeout(timeout_duration, child.wait_with_output()).await;
+    // Store the child ID for later killing if needed
+    let child_id = child.id();
     
-    // Check memory monitor result - (exceeded_limit, last_memory_value, peak_memory)
-    let (memory_limit_exceeded, memory_value, peak_memory) = memory_monitor.await.unwrap_or((false, 0, 0));
+    // Wait for the process with timeout
+    let result = timeout(timeout_duration, child.wait_with_output()).await;
     
-    match timeout_result {
+    // Process the result
+    match result {
         Ok(Ok(output)) => {
-            // Process completed within timeout
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let elapsed = start_time.elapsed();
             
-            // If memory limit was exceeded, override exit status and message
-            if memory_limit_exceeded {
-                info!("Process was terminated due to memory limit violation");
-                
-                let mut combined_stderr = stderr;
-                if !combined_stderr.is_empty() {
-                    combined_stderr.push_str("\n");
-                }
-                combined_stderr.push_str(&format!("ERROR: Process terminated due to memory limit violation (used {}MB, limit {}MB)", 
-                    memory_value, config.memory_limit_mb));
-                
-                return Ok(SandboxResult {
-                    exit_status: 137, // Standard exit code for SIGKILL
-                    stdout,
-                    stderr: combined_stderr,
-                    execution_time: elapsed,
-                    peak_memory_kb: None,
-                });
-            }
-            
-            // Normal completion
-            info!("Process completed in {:.2} seconds", elapsed.as_secs_f64());
-            info!("Exit status: {}", output.status);
-            info!("Peak memory usage: {} MB", peak_memory);
+            // Try to get memory usage results
+            let peak_memory = match memory_monitor_handle.await {
+                Ok(Ok(mem)) => Some(mem),
+                Ok(Err(SandboxError::MemoryLimitExceeded(_, _))) => {
+                    // Memory limit was exceeded, but process completed anyway
+                    // Return the output with an error code
+                    return Ok(SandboxResult {
+                        exit_status: 1,
+                        stdout,
+                        stderr: format!("{}\nMemory limit exceeded", stderr),
+                        execution_time: start_time.elapsed(),
+                        peak_memory_kb: None,
+                    });
+                },
+                _ => None,
+            };
             
             Ok(SandboxResult {
-                exit_status: output.status.code().unwrap_or(-1),
+                exit_status: output.status.code().unwrap_or(1),
                 stdout,
                 stderr,
-                execution_time: elapsed,
-                peak_memory_kb: None,
+                execution_time: start_time.elapsed(),
+                peak_memory_kb: peak_memory,
             })
-        }
+        },
         Ok(Err(e)) => {
-            // Process execution failed
             Err(SandboxError::ExecutionError(format!("Failed to execute: {}", e)))
-        }
+        },
         Err(_) => {
             // Timeout occurred
-            info!("Process timed out after {} seconds", config.timeout_s);
+            // Try to kill the process using the stored ID
+            if let Some(id) = child_id {
+                // Use platform-specific methods to kill the process
+                #[cfg(target_os = "macos")]
+                {
+                    use std::process::Command;
+                    let _ = Command::new("kill")
+                        .arg("-9")
+                        .arg(id.to_string())
+                        .output();
+                }
+                
+                #[cfg(target_os = "linux")]
+                {
+                    use std::process::Command;
+                    let _ = Command::new("kill")
+                        .arg("-9")
+                        .arg(id.to_string())
+                        .output();
+                }
+            }
+            
             Err(SandboxError::TimeoutError(config.timeout_s))
-        }
+        },
     }
-}
-
-/// Get memory usage on macOS for a given process ID
-#[cfg(target_os = "macos")]
-fn get_macos_memory_usage(pid: u32) -> Option<u64> {
-    use std::process::Command;
-    
-    // Use ps command to get memory information on macOS
-    // RSS (Resident Set Size) is the actual physical memory used
-    let output = Command::new("ps")
-        .args(&["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    
-    if !output.status.success() {
-        return None;
-    }
-    
-    // Parse the output (RSS in KB)
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let rss_kb = stdout.trim().parse::<u64>().ok()?;
-    
-    // Convert KB to MB
-    Some(rss_kb / 1024)
 }
 
 #[cfg(all(feature = "linux", target_os = "linux"))]

@@ -247,4 +247,55 @@ pub fn monitor_resources(_pid: u32, _interval: Duration) -> Result<ResourceStats
     };
     
     Ok(stats)
+}
+
+#[cfg(target_os = "macos")]
+pub fn get_memory_usage_macos(pid: u32) -> Result<u64> {
+    use std::process::Command;
+    
+    // Use ps command to get memory information on macOS
+    // RSS (Resident Set Size) is the actual physical memory used in KB
+    let output = Command::new("ps")
+        .args(&["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to execute ps command: {}", e))?;
+    
+    if !output.status.success() {
+        return Err(anyhow::anyhow!("ps command failed"));
+    }
+    
+    // Parse the output (RSS in KB)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let rss_kb = stdout.trim().parse::<u64>()
+        .map_err(|e| anyhow::anyhow!("Failed to parse memory usage: {}", e))?;
+    
+    Ok(rss_kb)
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_memory_usage_linux(pid: u32) -> Result<u64> {
+    // Read memory usage from /proc/{pid}/status
+    // VmRSS field shows the actual physical memory used by the process in KB
+    let status_content = std::fs::read_to_string(format!("/proc/{}/status", pid))
+        .map_err(|e| anyhow::anyhow!("Failed to read process status: {}", e))?;
+    
+    // Parse VmRSS line to get memory usage in KB
+    for line in status_content.lines() {
+        if line.starts_with("VmRSS:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(memory_kb) = parts[1].parse::<u64>() {
+                    return Ok(memory_kb);
+                }
+            }
+        }
+    }
+    
+    Err(anyhow::anyhow!("Could not find VmRSS field in process status"))
+}
+
+// Fallback for other platforms
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn get_memory_usage_generic(_pid: u32) -> Result<u64> {
+    Err(anyhow::anyhow!("Memory usage monitoring not implemented for this platform"))
 } 

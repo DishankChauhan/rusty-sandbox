@@ -11,15 +11,19 @@ use tokio::time;
 use std::fs;
 
 #[cfg(feature = "wasm")]
-use wasmtime::{Engine, Module, Store, Config, Linker, ResourceLimiter, ResourceLimiterAsync};
+use wasmtime::{Engine, Module, Store, Config, Linker};
 #[cfg(feature = "wasm")]
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, sync::WasiFile};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
+#[cfg(feature = "wasm")]
+use wasi_common::WasiFile;
 #[cfg(feature = "wasm")]
 use wasi_common::pipe::{ReadPipe, WritePipe};
 #[cfg(feature = "wasm")]
 use std::sync::{Mutex, RwLock};
 #[cfg(feature = "wasm")]
-use std::io::Write;
+use std::future::Future;
+#[cfg(feature = "wasm")]
+use std::pin::Pin;
 #[cfg(feature = "wasm")]
 use wat;
 
@@ -46,8 +50,9 @@ impl WasmExecutor {
         if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
             if ext == "wat" {
                 info!("Converting WebAssembly Text Format to binary WASM");
-                return wat::parse_bytes(&content)
-                    .with_context(|| format!("Failed to parse WAT file: {:?}", file_path));
+                let result = wat::parse_bytes(&content)
+                    .with_context(|| format!("Failed to parse WAT file: {:?}", file_path))?;
+                return Ok(result.to_vec());
             }
         }
         
@@ -122,31 +127,6 @@ impl RuntimeExecutor for WasmExecutor {
     }
 }
 
-// Resource limiter for Wasmtime
-#[cfg(feature = "wasm")]
-struct SandboxResourceLimiter {
-    memory_limit_bytes: usize,
-    instance_count_limit: u32,
-}
-
-#[cfg(feature = "wasm")]
-impl ResourceLimiter for SandboxResourceLimiter {
-    fn memory_growing(&mut self, _current: usize, desired: usize, _maximum: Option<usize>) -> Result<bool, anyhow::Error> {
-        Ok(desired <= self.memory_limit_bytes)
-    }
-
-    fn table_growing(&mut self, _current: u32, desired: u32, _maximum: Option<u32>) -> Result<bool, anyhow::Error> {
-        Ok(desired <= 10000) // Reasonable table size limit
-    }
-    
-    fn instances_created(&self, count: u32) -> Result<bool, anyhow::Error> {
-        Ok(count <= self.instance_count_limit)
-    }
-}
-
-#[cfg(feature = "wasm")]
-impl ResourceLimiterAsync for SandboxResourceLimiter {}
-
 // Actual WASM execution using Wasmtime
 fn execute_wasm_file(file_path: &Path, policy: &SandboxPolicy) -> Result<ExecutionResult> {
     #[cfg(feature = "wasm")]
@@ -155,9 +135,9 @@ fn execute_wasm_file(file_path: &Path, policy: &SandboxPolicy) -> Result<Executi
         let wasm_bytes = if file_path.extension().and_then(|e| e.to_str()) == Some("wat") {
             info!("Converting WAT to WASM...");
             let wat_content = fs::read(file_path)?;
-            wat::parse_bytes(&wat_content)
-                .with_context(|| format!("Failed to parse WAT file: {:?}", file_path))?
-                .to_vec()
+            let result = wat::parse_bytes(&wat_content)
+                .with_context(|| format!("Failed to parse WAT file: {:?}", file_path))?;
+            result.to_vec()
         } else {
             // Read WASM file directly
             fs::read(file_path)?
@@ -190,7 +170,8 @@ fn execute_wasm_file(file_path: &Path, policy: &SandboxPolicy) -> Result<Executi
             
         // Set up environment access based on security policy
         if policy.enable_network {
-            wasi_builder = wasi_builder.inherit_network();
+            // In newer wasmtime, network access is managed differently
+            wasi_builder = wasi_builder.inherit_env()?;
         }
         
         // Map allowed paths to WASI
@@ -200,7 +181,12 @@ fn execute_wasm_file(file_path: &Path, policy: &SandboxPolicy) -> Result<Executi
                 
             if canonical_path.exists() {
                 let guest_path = format!("/{}", canonical_path.file_name().unwrap_or_default().to_string_lossy());
-                wasi_builder = wasi_builder.preopened_dir(canonical_path, guest_path)?;
+                
+                // Create directory handle with cap-std
+                use cap_std::fs::Dir;
+                let dir = Dir::open_ambient_dir(&canonical_path, cap_std::ambient_authority())?;
+                
+                wasi_builder = wasi_builder.preopened_dir(dir, guest_path)?;
             }
         }
         
@@ -209,20 +195,15 @@ fn execute_wasm_file(file_path: &Path, policy: &SandboxPolicy) -> Result<Executi
         // Compile WASM module
         let module = Module::new(&engine, &wasm_bytes)?;
         
-        // Create store with WASI context
-        let limiter = SandboxResourceLimiter {
-            memory_limit_bytes: policy.memory_limit_kb.unwrap_or(100_000) * 1024,
-            instance_count_limit: 1,
-        };
-        let mut store = Store::new(&engine, (wasi, limiter));
+        // Create store
+        let mut store = Store::new(&engine, wasi);
         
         // Create linker and add WASI imports
         let mut linker = Linker::new(&engine);
-        wasmtime_wasi::add_to_linker(&mut linker, |ctx| ctx)?;
+        wasmtime_wasi::add_to_linker(&mut linker, |s| s)?;
         
         // Track memory usage
         let peak_memory = Arc::new(Mutex::new(0u64));
-        let peak_memory_clone = peak_memory.clone();
         
         // Execute module
         let start_time = Instant::now();
@@ -231,7 +212,7 @@ fn execute_wasm_file(file_path: &Path, policy: &SandboxPolicy) -> Result<Executi
         let instance = linker.instantiate(&mut store, &module)?;
         
         // Find the entry point - try _start first (WASI convention)
-        let result = if let Ok(start) = instance.get_func(&mut store, "_start") {
+        let result = if let Some(start) = instance.get_func(&mut store, "_start") {
             // Execute the _start function
             match start.call(&mut store, &[], &mut []) {
                 Ok(_) => {
@@ -267,7 +248,7 @@ fn execute_wasm_file(file_path: &Path, policy: &SandboxPolicy) -> Result<Executi
                     })
                 }
             }
-        } else if let Ok(main) = instance.get_func(&mut store, "main") {
+        } else if let Some(main) = instance.get_func(&mut store, "main") {
             // Try calling a "main" function instead
             match main.call(&mut store, &[], &mut []) {
                 Ok(_) => {

@@ -33,10 +33,10 @@ extra_args = "--no-warnings"
 modules_dir = "./node_modules"
 
 [runtimes.wasm]
-wasi_enabled = true
-max_memory_pages = 100  # 6.4MB (64KB * 100)
-stack_size = 65536      # 64KB
-allow_bulk_memory = true
+wasi_enabled = "true"
+max_memory_pages = "100"  # 6.4MB (64KB * 100)
+stack_size = "65536"      # 64KB
+allow_bulk_memory = "true"
 
 # Custom extension mappings
 [runtimes.extensions]

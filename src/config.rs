@@ -103,14 +103,18 @@ impl SandboxConfig {
     /// Load configuration, searching in multiple locations
     pub fn load() -> Result<Self> {
         // Search paths in priority order
-        let search_paths = [
+        let mut search_paths = vec![
             PathBuf::from("./sandbox.toml"),
             PathBuf::from("./config/sandbox.toml"),
-            dirs::config_dir().map(|p| p.join("rusty-sandbox/sandbox.toml")),
         ];
         
+        // Add config_dir path if available
+        if let Some(config_dir) = dirs::config_dir() {
+            search_paths.push(config_dir.join("rusty-sandbox/sandbox.toml"));
+        }
+        
         // Try each path
-        for path in search_paths.iter().flatten() {
+        for path in &search_paths {
             if path.exists() {
                 info!("Loading configuration from {:?}", path);
                 return Self::from_file(path);
