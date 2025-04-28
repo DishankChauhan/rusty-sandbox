@@ -56,6 +56,7 @@ impl RuntimeExecutor for JavaScriptExecutor {
             exit_status: result.exit_status,
             execution_time: start_time.elapsed(),
             peak_memory_kb: result.peak_memory_kb,
+            resource_metrics: None,
         })
     }
 } 

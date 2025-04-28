@@ -1,4 +1,4 @@
-use anyhow::Result as AnyhowResult;
+use anyhow::{Result, anyhow, Context};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -645,10 +645,446 @@ fn apply_linux_security_features(config: &SandboxConfig) -> Result<(), SandboxEr
     create_namespaces()?;
     
     // Change root to temporary directory for filesystem isolation
-    // This would be implemented here in a full version
+    apply_filesystem_isolation()?;
     
     // Apply seccomp filter to restrict syscalls
     apply_seccomp_filter()?;
     
     Ok(())
+}
+
+/// Apply filesystem isolation using chroot or mount namespaces
+#[cfg(all(feature = "linux", target_os = "linux"))]
+fn apply_filesystem_isolation() -> Result<(), SandboxError> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use nix::unistd::{chroot, chdir};
+    use nix::mount::{mount, MsFlags};
+    use tempfile::TempDir;
+    
+    // Create a temporary directory for the chroot environment
+    let chroot_dir = TempDir::new()
+        .map_err(|e| SandboxError::OtherError(format!("Failed to create chroot directory: {}", e)))?;
+    
+    // Create necessary directories in the chroot environment
+    let dirs = ["bin", "lib", "lib64", "usr", "tmp", "dev", "proc"];
+    for dir in &dirs {
+        let path = chroot_dir.path().join(dir);
+        fs::create_dir_all(&path)
+            .map_err(|e| SandboxError::OtherError(format!("Failed to create directory {}: {}", path.display(), e)))?;
+        
+        // Set appropriate permissions
+        let metadata = fs::metadata(&path)
+            .map_err(|e| SandboxError::OtherError(format!("Failed to get metadata for {}: {}", path.display(), e)))?;
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o755); // rwxr-xr-x
+        fs::set_permissions(&path, perms)
+            .map_err(|e| SandboxError::OtherError(format!("Failed to set permissions for {}: {}", path.display(), e)))?;
+    }
+    
+    // Mount /proc in the chroot for process information
+    let proc_path = chroot_dir.path().join("proc");
+    mount(
+        Some("proc"),
+        &proc_path,
+        Some("proc"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    ).map_err(|e| SandboxError::OtherError(format!("Failed to mount proc: {}", e)))?;
+    
+    // Mount /dev in the chroot for essential device files
+    let dev_path = chroot_dir.path().join("dev");
+    mount(
+        Some("tmpfs"),
+        &dev_path,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        None::<&str>,
+    ).map_err(|e| SandboxError::OtherError(format!("Failed to mount dev: {}", e)))?;
+    
+    // Create essential device nodes in /dev
+    // /dev/null
+    let null_path = dev_path.join("null");
+    fs::File::create(&null_path)
+        .map_err(|e| SandboxError::OtherError(format!("Failed to create /dev/null: {}", e)))?;
+    nix::sys::stat::mknod(&null_path, nix::sys::stat::SFlag::S_IFCHR, 0o666, nix::sys::stat::makedev(1, 3))
+        .map_err(|e| SandboxError::OtherError(format!("Failed to create /dev/null device: {}", e)))?;
+    
+    // /dev/zero
+    let zero_path = dev_path.join("zero");
+    fs::File::create(&zero_path)
+        .map_err(|e| SandboxError::OtherError(format!("Failed to create /dev/zero: {}", e)))?;
+    nix::sys::stat::mknod(&zero_path, nix::sys::stat::SFlag::S_IFCHR, 0o666, nix::sys::stat::makedev(1, 5))
+        .map_err(|e| SandboxError::OtherError(format!("Failed to create /dev/zero device: {}", e)))?;
+    
+    // /dev/urandom
+    let urandom_path = dev_path.join("urandom");
+    fs::File::create(&urandom_path)
+        .map_err(|e| SandboxError::OtherError(format!("Failed to create /dev/urandom: {}", e)))?;
+    nix::sys::stat::mknod(&urandom_path, nix::sys::stat::SFlag::S_IFCHR, 0o666, nix::sys::stat::makedev(1, 9))
+        .map_err(|e| SandboxError::OtherError(format!("Failed to create /dev/urandom device: {}", e)))?;
+    
+    // Create a directory for the executable and its dependencies
+    let exec_dir = chroot_dir.path().join("app");
+    fs::create_dir_all(&exec_dir)
+        .map_err(|e| SandboxError::OtherError(format!("Failed to create app directory: {}", e)))?;
+    
+    // Change root to the temporary directory
+    chroot(chroot_dir.path())
+        .map_err(|e| SandboxError::OtherError(format!("Failed to chroot: {}", e)))?;
+    
+    // Change current directory to /app within the chroot
+    chdir("/app")
+        .map_err(|e| SandboxError::OtherError(format!("Failed to change directory: {}", e)))?;
+    
+    // The temporary directory will be automatically cleaned up when it goes out of scope
+    // But since we've chrooted, the cleanup will happen when the process exits
+    
+    // Prevent the TempDir from being dropped and removed
+    // (the OS will clean it up when the process exits)
+    std::mem::forget(chroot_dir);
+    
+    Ok(())
+}
+
+// Implementation for macOS
+#[cfg(target_os = "macos")]
+fn apply_filesystem_isolation() -> Result<(), SandboxError> {
+    // On macOS, we rely on the sandbox-exec mechanism implemented in security.rs
+    // macOS doesn't support chroot for non-root users, so we use the built-in sandbox feature
+    info!("Using macOS sandbox for filesystem isolation");
+    Ok(())
+}
+
+// Generic implementation for other platforms
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn apply_filesystem_isolation() -> Result<(), SandboxError> {
+    warn!("Filesystem isolation not fully supported on this platform");
+    Ok(())
+}
+
+/// Terminate a process by its PID
+fn terminate_process(pid: i32, force: bool) -> Result<()> {
+    // Store the child ID for later killing if needed
+    #[cfg(target_family = "unix")]
+    {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        
+        let signal = if force {
+            Signal::SIGKILL
+        } else {
+            Signal::SIGTERM
+        };
+        
+        // Send signal to process group to terminate all children
+        let result = kill(Pid::from_raw(-pid), signal);
+        
+        if let Err(e) = result {
+            // Only report error if process still exists
+            if e != nix::Error::ESRCH {
+                return Err(anyhow!("Failed to terminate process {}: {}", pid, e));
+            }
+        }
+        
+        // Wait a bit for process to terminate
+        let wait_time = if force {
+            std::time::Duration::from_millis(100)
+        } else {
+            std::time::Duration::from_millis(500)
+        };
+        
+        std::thread::sleep(wait_time);
+        
+        // Check if process still exists
+        if process_exists(pid) {
+            if !force {
+                // Try again with SIGKILL
+                warn!("Process {} didn't terminate with SIGTERM, trying SIGKILL", pid);
+                return terminate_process(pid, true);
+            } else {
+                return Err(anyhow!("Failed to terminate process {} even with SIGKILL", pid));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    #[cfg(not(target_family = "unix"))]
+    {
+        // Windows or other non-Unix platforms
+        #[cfg(target_os = "windows")]
+        {
+            use std::process::Command;
+            
+            // On Windows, use taskkill
+            let args = if force {
+                ["/F", "/T", "/PID", &pid.to_string()]
+            } else {
+                ["/T", "/PID", &pid.to_string()]
+            };
+            
+            let output = Command::new("taskkill")
+                .args(&args)
+                .output()
+                .context("Failed to execute taskkill command")?;
+                
+            if !output.status.success() {
+                let error = String::from_utf8_lossy(&output.stderr);
+                if !error.contains("not found") && !error.contains("not running") {
+                    return Err(anyhow!("Failed to terminate process {}: {}", pid, error));
+                }
+            }
+            
+            Ok(())
+        }
+        
+        #[cfg(not(target_os = "windows"))]
+        {
+            Err(anyhow!("Process termination not implemented for this platform"))
+        }
+    }
+}
+
+/// Check if a process exists
+fn process_exists(pid: i32) -> bool {
+    #[cfg(target_family = "unix")]
+    {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        
+        // Send signal 0 to check if process exists
+        kill(Pid::from_raw(pid), Signal::SIGCONT).is_ok()
+    }
+    
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        
+        // On Windows, use tasklist to check if process exists
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .output();
+            
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout.contains(&pid.to_string())
+            },
+            Err(_) => false,
+        }
+    }
+    
+    #[cfg(not(any(target_family = "unix", target_os = "windows")))]
+    {
+        // Default implementation for other platforms - use sysinfo
+        use sysinfo::{System, SystemExt, ProcessExt, PidExt};
+        
+        let mut system = System::new_all();
+        system.refresh_all();
+        
+        let sys_pid = sysinfo::Pid::from_u32(pid as u32);
+        system.process(sys_pid).is_some()
+    }
+}
+
+/// Get the command line of a process
+fn get_process_command(pid: i32) -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::fs::read_to_string;
+        use std::path::Path;
+        
+        // Read from /proc/<pid>/cmdline
+        let cmdline_path = Path::new("/proc").join(pid.to_string()).join("cmdline");
+        let cmdline = read_to_string(cmdline_path)
+            .with_context(|| format!("Failed to read command line for process {}", pid))?;
+            
+        // /proc/cmdline uses null bytes as separators
+        let cmd = cmdline.replace('\0', " ").trim().to_string();
+        Ok(cmd)
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        
+        // Use ps on macOS
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .context("Failed to execute ps command")?;
+            
+        if !output.status.success() {
+            return Err(anyhow!("Failed to get command line for process {}", pid));
+        }
+        
+        let cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(cmd)
+    }
+    
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        
+        // Use wmic on Windows
+        let output = Command::new("wmic")
+            .args(["process", "where", &format!("ProcessId={}", pid), "get", "CommandLine", "/format:list"])
+            .output()
+            .context("Failed to execute wmic command")?;
+            
+        if !output.status.success() {
+            return Err(anyhow!("Failed to get command line for process {}", pid));
+        }
+        
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Parse out the CommandLine=<value> format
+        if let Some(cmd_line) = stdout.lines()
+            .find(|line| line.starts_with("CommandLine="))
+            .map(|line| line.trim_start_matches("CommandLine=").trim()) {
+            Ok(cmd_line.to_string())
+        } else {
+            Err(anyhow!("Could not parse command line for process {}", pid))
+        }
+    }
+    
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        // Default implementation for other platforms - use sysinfo
+        use sysinfo::{System, SystemExt, ProcessExt, PidExt};
+        
+        let mut system = System::new_all();
+        system.refresh_all();
+        
+        let sys_pid = sysinfo::Pid::from_u32(pid as u32);
+        if let Some(process) = system.process(sys_pid) {
+            Ok(process.cmd().join(" "))
+        } else {
+            Err(anyhow!("Process {} not found", pid))
+        }
+    }
+}
+
+/// Get children of a process
+fn get_process_children(pid: i32) -> Result<Vec<i32>> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::fs;
+        use std::path::Path;
+        
+        // Find all processes with this parent
+        let mut children = Vec::new();
+        let proc_dir = Path::new("/proc");
+        
+        if let Ok(entries) = fs::read_dir(proc_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                // Check if this is a PID directory
+                if let Ok(entry_pid) = entry.file_name().to_string_lossy().parse::<i32>() {
+                    // Skip the process itself
+                    if entry_pid == pid {
+                        continue;
+                    }
+                    
+                    // Read status file to get parent PID
+                    let status_path = entry.path().join("status");
+                    if let Ok(status) = fs::read_to_string(status_path) {
+                        // Look for PPid: line
+                        for line in status.lines() {
+                            if line.starts_with("PPid:") {
+                                if let Ok(ppid) = line.trim_start_matches("PPid:").trim().parse::<i32>() {
+                                    if ppid == pid {
+                                        children.push(entry_pid);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(children)
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        
+        // Use pgrep on macOS to find children
+        let output = Command::new("pgrep")
+            .args(["-P", &pid.to_string()])
+            .output()
+            .context("Failed to execute pgrep command")?;
+            
+        // pgrep returns non-zero if no matches, which is fine
+        if !output.status.success() && !output.stdout.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // Parse the output to get PIDs
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let children: Vec<i32> = stdout
+            .lines()
+            .filter_map(|line| line.trim().parse::<i32>().ok())
+            .collect();
+            
+        Ok(children)
+    }
+    
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        
+        // Use wmic on Windows to find children
+        let output = Command::new("wmic")
+            .args(["process", "where", &format!("ParentProcessId={}", pid), "get", "ProcessId", "/format:list"])
+            .output()
+            .context("Failed to execute wmic command")?;
+            
+        if !output.status.success() {
+            return Err(anyhow!("Failed to get child processes for {}", pid));
+        }
+        
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        
+        // Parse out the ProcessId=<value> format
+        let children: Vec<i32> = stdout.lines()
+            .filter(|line| line.starts_with("ProcessId="))
+            .filter_map(|line| {
+                line.trim_start_matches("ProcessId=").trim().parse::<i32>().ok()
+            })
+            .collect();
+            
+        Ok(children)
+    }
+    
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        // Default implementation for other platforms - use sysinfo
+        use sysinfo::{System, SystemExt, ProcessExt, PidExt};
+        
+        let mut system = System::new_all();
+        system.refresh_all();
+        
+        let sys_pid = sysinfo::Pid::from_u32(pid as u32);
+        
+        // Find all processes with this parent
+        let children: Vec<i32> = system.processes().iter()
+            .filter_map(|(child_pid, process)| {
+                if let Some(parent_pid) = process.parent() {
+                    if parent_pid == sys_pid {
+                        // Convert sysinfo Pid to i32
+                        Some(child_pid.as_u32() as i32)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+            
+        Ok(children)
+    }
 } 

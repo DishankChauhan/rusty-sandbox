@@ -4,6 +4,8 @@ use std::path::Path;
 use std::time::Duration;
 use std::collections::HashMap;
 
+use crate::resources::ResourceMetrics;
+
 /// The ExecutionResult contains the output of running a file in a sandbox
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {
@@ -12,6 +14,7 @@ pub struct ExecutionResult {
     pub exit_status: i32,
     pub execution_time: Duration,
     pub peak_memory_kb: Option<u64>,
+    pub resource_metrics: Option<ResourceMetrics>,
 }
 
 /// SandboxPolicy defines the resource limits and security settings
@@ -105,5 +108,24 @@ impl RuntimeRegistry {
             extensions.extend(executor.supported_extensions());
         }
         extensions
+    }
+    
+    /// Check if any registered executor supports the given file
+    pub fn supports_file(&self, file_path: &Path) -> bool {
+        self.find_executor_for_file(file_path).is_some()
+    }
+    
+    /// Execute a file using the appropriate executor
+    pub async fn execute_file(
+        &self, 
+        file_path: &Path, 
+        policy: &SandboxPolicy,
+        _stdin: Option<String>, // Ignored for now, since RuntimeExecutor doesn't support stdin
+    ) -> Result<ExecutionResult> {
+        if let Some(executor) = self.find_executor_for_file(file_path) {
+            executor.execute(file_path, policy).await
+        } else {
+            Err(anyhow!("No executor found for file: {:?}", file_path))
+        }
     }
 } 

@@ -1,85 +1,72 @@
-# 🛡️ Rusty Sandbox
+# Rusty Sandbox
 
-A secure sandbox for executing untrusted code, implemented in Rust.
+Rusty Sandbox is a secure code execution environment implemented in Rust. It allows for isolated execution of untrusted code in multiple languages including Python, JavaScript, and WebAssembly.
 
-## 🚀 Features
+## Features
 
-- **Secure Execution**: Run untrusted code with strong isolation
-- **Resource Limits**: Restrict memory, CPU, and file system usage
-- **Multi-language Support**: Execute Python, JavaScript, and WebAssembly code
-- **Plugin Architecture**: Easily extend with support for additional languages
-- **Configuration System**: Customize sandbox behavior through a flexible configuration file
+### Phase 1: Core Sandboxing
+- Secure execution environment for untrusted code
+- Support for multiple languages:
+  - Python
+  - JavaScript
+  - WebAssembly
+- Resource limiting (CPU, memory, execution time)
+- Static code analysis to prevent malicious code execution
+- Simple CLI interface
 
-## 📋 Supported Languages
+### Phase 2: Advanced Features 
+- File system isolation
+- Network access control
+- Process isolation
+- Enhanced security measures
 
-- **Python** (`.py` files)
-- **JavaScript** (`.js` files)
-- **WebAssembly** (`.wasm` files)
+### Phase 3: Monitoring and Telemetry
+- Advanced resource monitoring
+- Security breach detection
+- Real-time telemetry
+- Terminal-based monitoring dashboard
+- Cross-platform support (Linux, macOS)
 
-## 📦 Installation
+## Installation
 
+### Prerequisites
+- Rust 1.65+
+- Python 3.6+ (for Python support)
+- Node.js 16+ (for JavaScript support)
+- WASM runtime (for WebAssembly support)
+
+### Building from source
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/rusty-sandbox.git
+git clone https://github.com/DishankChauhan/rusty-sandbox.git
 cd rusty-sandbox
 
-# Build the project
+# Build in release mode
 cargo build --release
 
 # Install (optional)
 cargo install --path .
 ```
 
-## 🔧 Usage
+## Usage
 
-### Basic Usage
-
+### Basic usage
 ```bash
-# Run a Python file
-rusty-sandbox run examples/hello.py
+# Run a file in the sandbox
+rusty-sandbox run file.py
 
-# Run a JavaScript file
-rusty-sandbox run examples/hello.js
-
-# Run a WebAssembly file
-rusty-sandbox run examples/hello.wasm
+# Set custom resource limits
+rusty-sandbox run file.js --memory-limit 256 --cpu-limit 2 --timeout 5
 
 # List supported file types
 rusty-sandbox list-supported
 ```
 
-### Custom Resource Limits
-
-```bash
-# Override memory limit (in MB)
-rusty-sandbox run examples/hello.py --memory-limit 256
-
-# Override CPU time limit (in seconds)
-rusty-sandbox run examples/hello.py --cpu-limit 2
-
-# Override execution timeout (in seconds)
-rusty-sandbox run examples/hello.py --timeout 5
-```
-
-### Custom Configuration
-
-```bash
-# Use a custom configuration file
-rusty-sandbox --config my-sandbox.toml run examples/hello.py
-```
-
-## ⚙️ Configuration
-
-Rusty Sandbox uses a TOML configuration file (`sandbox.toml`) for customization. The configuration file can be placed in:
-
-- Current directory (`./sandbox.toml`)
-- Config directory (`./config/sandbox.toml`)
-- User config directory (`~/.config/rusty-sandbox/sandbox.toml`)
-
-### Example Configuration
+### Configuration
+Rusty Sandbox can be configured using a TOML configuration file:
 
 ```toml
-# Rusty Sandbox Configuration
+# Example configuration file
 
 [general]
 working_dir = "./workspace"
@@ -91,56 +78,120 @@ memory_limit_mb = 512
 cpu_time_limit_s = 5
 timeout_s = 10
 max_processes = 10
-max_file_size_kb = 5120  # 5MB
+max_file_size_kb = 5120
 max_open_files = 20
 
 [security]
 enable_network = false
-allowed_paths = [
-    "./examples",
-    "./workspace"
-]
+allowed_paths = ["/tmp", "./workspace"]
 
-# Runtime-specific configurations
 [runtimes.python]
-interpreter = "python3"
-extra_args = "--no-site-packages"
+interpreter = "/usr/bin/python3"
+packages_path = "./python_packages"
 
 [runtimes.javascript]
-runtime = "node"
-extra_args = "--no-warnings"
+interpreter = "/usr/bin/node"
+modules_path = "./node_modules"
 
 [runtimes.wasm]
-wasi_enabled = true
-max_memory_pages = 100  # 6.4MB
+enable_memory_growth = true
+max_memory_pages = 100
 ```
 
-## 🔌 Plugin Architecture
+## Security Features
 
-Rusty Sandbox uses a plugin-based architecture for language support. Each language is implemented as a `RuntimeExecutor` that can be registered with the system.
+### Static Analysis
+Rusty Sandbox performs static analysis on code before execution to detect potentially dangerous operations:
+- System command execution
+- File operations outside allowed paths
+- Network access
+- Dangerous library imports
+- Dynamic code evaluation
 
-To add support for a new language:
+### Process Isolation
+- Process limits and resource constraints
+- Namespace isolation on Linux
+- Strict file access controls
+- Optional chroot jails
 
-1. Implement the `RuntimeExecutor` trait
-2. Register the executor with the `RuntimeRegistry`
-3. Add appropriate configurations to the `sandbox.toml` file
+### Resource Limiting
+- Memory usage limits
+- CPU usage limits
+- Execution timeouts
+- File size and count limits
+- Process count limits
 
-## 🔒 Security
+### Security Monitoring
+- Real-time security event monitoring
+- Breach detection and alerting
+- Comprehensive audit logs
+- Process hierarchy verification
 
-Rusty Sandbox provides multiple layers of security:
+## Architecture
 
-- **Resource Limits**: Restrict memory usage, CPU time, file descriptors, etc.
-- **Code Linting**: Detect potentially dangerous code patterns before execution
-- **Sandboxing**: Use OS-level isolation mechanisms (seccomp, namespaces, etc. on Linux)
-- **Execution Timeout**: Automatically terminate long-running processes
-- **File System Isolation**: Restrict access to the file system
+### Core Components
+- **RuntimeExecutor Trait**: Interface for language-specific executors
+- **RuntimeRegistry**: Manages available language executors
+- **SandboxPolicy**: Defines resource limits and security settings
+- **Watchdog Service**: Monitors sandbox integrity
+- **Telemetry System**: Collects performance and security metrics
+- **Dashboard**: Real-time monitoring UI
 
-## 📝 License
+### Execution Flow
+1. Code is submitted for execution
+2. Static analysis checks for dangerous patterns
+3. Appropriate runtime executor is selected
+4. Sandbox environment is prepared
+5. Resources are limited and security measures applied
+6. Code is executed with watchdog monitoring
+7. Results are returned with execution metrics
+8. Resources are cleaned up
+
+## Extending
+
+### Adding new language support
+To add support for a new language, implement the `RuntimeExecutor` trait and register the new executor with the `RuntimeRegistry`.
+
+```rust
+use crate::runtime::{RuntimeExecutor, SandboxPolicy, ExecutionResult};
+
+pub struct MyLanguageExecutor;
+
+#[async_trait]
+impl RuntimeExecutor for MyLanguageExecutor {
+    fn name(&self) -> &'static str {
+        "mylanguage"
+    }
+    
+    fn supported_extensions(&self) -> &[&'static str] {
+        &["mylang"]
+    }
+    
+    fn lint_code(&self, content: &str) -> Result<()> {
+        // Implement linting for the language
+    }
+    
+    async fn execute(&self, file_path: &Path, policy: &SandboxPolicy) -> Result<ExecutionResult> {
+        // Implement execution logic
+    }
+}
+```
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+1. Fork the project
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
-## 🔗 Related Projects
+## Acknowledgments
 
-- [Wasmtime](https://wasmtime.dev/) - Used for WebAssembly execution
-- [Seccomp](https://en.wikipedia.org/wiki/Seccomp) - Linux kernel security feature for sandboxing
-- [WASI](https://wasi.dev/) - WebAssembly System Interface
+- This project is inspired by secure sandbox solutions like Firecracker, gVisor, and WASM sandboxes
+- Thanks to the Rust community for providing excellent libraries for system programming

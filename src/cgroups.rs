@@ -1,6 +1,10 @@
 use anyhow::{Result, anyhow, Context};
 use std::path::Path;
 use tracing::{info, warn, error};
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::process::Command;
+use std::path::PathBuf;
 
 #[cfg(all(feature = "linux", target_os = "linux"))]
 use cgroups_rs::{Cgroup, CgroupBuilder, Controller, cpu::CpuController, memory::MemController, blkio::BlkIoController};
@@ -246,217 +250,723 @@ impl CgroupConfig {
     }
 }
 
-/// Manages cgroups v2 for resource isolation
+/// CGroup version
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CgroupVersion {
+    /// CGroup v1 (legacy)
+    V1,
+    /// CGroup v2 (unified)
+    V2,
+    /// No CGroups available
+    None,
+}
+
+/// CGroup subsystem to manage
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CgroupSubsystem {
+    Cpu,
+    Memory,
+    PidsLimit,
+    BlockIO,
+    Devices,
+    Network,
+}
+
+impl CgroupSubsystem {
+    /// Get the name of the subsystem for cgroup v1
+    pub fn name_v1(&self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Memory => "memory",
+            Self::PidsLimit => "pids",
+            Self::BlockIO => "blkio",
+            Self::Devices => "devices",
+            Self::Network => "net_cls,net_prio",
+        }
+    }
+    
+    /// Get the prefix for files in cgroup v2
+    pub fn prefix_v2(&self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Memory => "memory",
+            Self::PidsLimit => "pids",
+            Self::BlockIO => "io",
+            Self::Devices => "devices",
+            Self::Network => "net",
+        }
+    }
+}
+
+/// Manages cgroup resources for sandboxed processes
 pub struct CgroupManager {
-    /// Base path for cgroups
-    base_path: PathBuf,
-    /// Cgroup name
-    name: String,
-    /// Full path to the cgroup
+    /// The version of cgroups available on this system
+    version: CgroupVersion,
+    /// Path to the cgroup
     cgroup_path: PathBuf,
+    /// Name of the cgroup
+    group_name: String,
+    /// Subsystems enabled
+    subsystems: Vec<CgroupSubsystem>,
     /// Whether the cgroup has been created
     created: bool,
 }
 
 impl CgroupManager {
-    /// Create a new cgroup manager with a unique name
-    pub fn new(name: &str) -> Result<Self> {
-        // Check if cgroups v2 is available
-        if !is_cgroupv2_available() {
-            return Err(anyhow!("cgroups v2 is not available on this system"));
-        }
-
-        let base_path = get_cgroup_mount_point()?;
-        let cgroup_path = base_path.join(name);
-
+    /// Create a new cgroup manager
+    pub fn new(group_name: &str) -> Result<Self> {
+        // Determine CGroup version
+        let version = Self::detect_cgroup_version()?;
+        
+        // Get the path to the cgroup
+        let cgroup_path = match version {
+            CgroupVersion::V1 => PathBuf::from("/sys/fs/cgroup"),
+            CgroupVersion::V2 => PathBuf::from("/sys/fs/cgroup"),
+            CgroupVersion::None => return Err(anyhow!("CGroups not available on this system")),
+        };
+        
         Ok(Self {
-            base_path,
-            name: name.to_string(),
+            version,
             cgroup_path,
+            group_name: group_name.to_string(),
+            subsystems: vec![],
             created: false,
         })
     }
-
+    
+    /// Detect the cgroup version available on this system
+    fn detect_cgroup_version() -> Result<CgroupVersion> {
+        // Check if cgroup v2 is mounted
+        let cgroup_v2_path = Path::new("/sys/fs/cgroup");
+        if cgroup_v2_path.exists() {
+            // Check if cgroup.controllers exists (v2 indicator)
+            let controllers_path = cgroup_v2_path.join("cgroup.controllers");
+            if controllers_path.exists() {
+                return Ok(CgroupVersion::V2);
+            }
+            
+            // Check for legacy v1 directories
+            let cpu_path = cgroup_v2_path.join("cpu");
+            let memory_path = cgroup_v2_path.join("memory");
+            
+            if cpu_path.exists() && memory_path.exists() {
+                return Ok(CgroupVersion::V1);
+            }
+        }
+        
+        // Check for v1 mounts directly
+        let mounts_output = Command::new("mount")
+            .output()
+            .map_err(|e| anyhow!("Failed to execute mount command: {}", e))?;
+            
+        let mounts_str = String::from_utf8_lossy(&mounts_output.stdout);
+        if mounts_str.contains("cgroup") {
+            return Ok(CgroupVersion::V1);
+        }
+        
+        // No cgroups found
+        Ok(CgroupVersion::None)
+    }
+    
+    /// Enable a specific cgroup subsystem
+    pub fn enable_subsystem(&mut self, subsystem: CgroupSubsystem) -> &mut Self {
+        if !self.subsystems.contains(&subsystem) {
+            self.subsystems.push(subsystem);
+        }
+        self
+    }
+    
     /// Create the cgroup
     pub fn create(&mut self) -> Result<()> {
         if self.created {
             return Ok(());
         }
-
-        // Create the cgroup directory
-        fs::create_dir_all(&self.cgroup_path)
-            .with_context(|| format!("Failed to create cgroup directory at {:?}", self.cgroup_path))?;
-
+        
+        match self.version {
+            CgroupVersion::V1 => self.create_v1()?,
+            CgroupVersion::V2 => self.create_v2()?,
+            CgroupVersion::None => return Err(anyhow!("CGroups not available on this system")),
+        }
+        
         self.created = true;
-        info!("Created cgroup: {}", self.name);
         Ok(())
     }
-
-    /// Apply resource limits defined in the config
-    pub fn apply_limits(&self, config: &CgroupConfig) -> Result<()> {
-        if !self.created {
-            return Err(anyhow!("Cgroup must be created before applying limits"));
+    
+    /// Create cgroup v1
+    fn create_v1(&self) -> Result<()> {
+        for subsystem in &self.subsystems {
+            let subsys_path = self.cgroup_path.join(subsystem.name_v1()).join(&self.group_name);
+            
+            // Create the directory if it doesn't exist
+            if !subsys_path.exists() {
+                fs::create_dir_all(&subsys_path)
+                    .map_err(|e| anyhow!("Failed to create cgroup directory {}: {}", 
+                                        subsys_path.display(), e))?;
+            }
+            
+            info!("Created cgroup v1 {} for subsystem {}", 
+                  self.group_name, subsystem.name_v1());
         }
-
-        // Apply memory limits
-        if let Some(memory_limit) = config.memory_limit_bytes {
-            self.write_cgroup_file("memory.max", &memory_limit.to_string())?;
+        
+        Ok(())
+    }
+    
+    /// Create cgroup v2
+    fn create_v2(&self) -> Result<()> {
+        let group_path = self.cgroup_path.join(&self.group_name);
+        
+        // Create the directory if it doesn't exist
+        if !group_path.exists() {
+            fs::create_dir_all(&group_path)
+                .map_err(|e| anyhow!("Failed to create cgroup directory {}: {}", 
+                                    group_path.display(), e))?;
         }
-
-        if let Some(memory_swap_limit) = config.memory_swap_limit_bytes {
-            self.write_cgroup_file("memory.swap.max", &memory_swap_limit.to_string())?;
-        }
-
-        // Apply CPU limits
-        if let Some((quota, period)) = config.cpu_max {
-            self.write_cgroup_file("cpu.max", &format!("{} {}", quota, period))?;
-        } else {
-            if let Some(quota) = config.cpu_quota_us {
-                if let Some(period) = config.cpu_period_us {
-                    self.write_cgroup_file("cpu.max", &format!("{} {}", quota, period))?;
-                }
+        
+        // Enable controllers
+        let controllers_file = self.cgroup_path.join("cgroup.controllers");
+        let subtree_control = self.cgroup_path.join("cgroup.subtree_control");
+        
+        if controllers_file.exists() && subtree_control.exists() {
+            // Read available controllers
+            let mut content = String::new();
+            File::open(controllers_file)
+                .map_err(|e| anyhow!("Failed to open cgroup.controllers: {}", e))?
+                .read_to_string(&mut content)
+                .map_err(|e| anyhow!("Failed to read cgroup.controllers: {}", e))?;
+                
+            // Enable controllers in parent
+            let mut subtree_file = File::create(subtree_control)
+                .map_err(|e| anyhow!("Failed to open cgroup.subtree_control: {}", e))?;
+                
+            for controller in content.split_whitespace() {
+                let _ = write!(subtree_file, "+{} ", controller);
             }
         }
-
-        if let Some(weight) = config.cpu_shares {
-            self.write_cgroup_file("cpu.weight", &weight.to_string())?;
-        }
-
-        // Apply IO limits
-        if let Some(weight) = config.io_weight {
-            self.write_cgroup_file("io.weight", &weight.to_string())?;
-        }
-
-        // Apply PID limits
-        if let Some(pids_max) = config.pids_max {
-            self.write_cgroup_file("pids.max", &pids_max.to_string())?;
-        }
-
-        info!("Applied resource limits to cgroup: {}", self.name);
+        
+        info!("Created cgroup v2 {}", self.group_name);
         Ok(())
     }
-
+    
     /// Add a process to the cgroup
     pub fn add_process(&self, pid: u32) -> Result<()> {
         if !self.created {
-            return Err(anyhow!("Cgroup must be created before adding processes"));
+            return Err(anyhow!("CGroup not created yet"));
         }
-
-        self.write_cgroup_file("cgroup.procs", &pid.to_string())?;
-        info!("Added process {} to cgroup: {}", pid, self.name);
+        
+        match self.version {
+            CgroupVersion::V1 => self.add_process_v1(pid)?,
+            CgroupVersion::V2 => self.add_process_v2(pid)?,
+            CgroupVersion::None => return Err(anyhow!("CGroups not available on this system")),
+        }
+        
         Ok(())
     }
-
-    /// Read current memory usage
+    
+    /// Add a process to cgroup v1
+    fn add_process_v1(&self, pid: u32) -> Result<()> {
+        for subsystem in &self.subsystems {
+            let tasks_path = self.cgroup_path
+                .join(subsystem.name_v1())
+                .join(&self.group_name)
+                .join("tasks");
+                
+            let mut file = File::create(&tasks_path)
+                .map_err(|e| anyhow!("Failed to open {} for writing: {}", tasks_path.display(), e))?;
+                
+            write!(file, "{}", pid)
+                .map_err(|e| anyhow!("Failed to write PID {} to {}: {}", 
+                                      pid, tasks_path.display(), e))?;
+        }
+        
+        info!("Added process {} to cgroup v1 {}", pid, self.group_name);
+        Ok(())
+    }
+    
+    /// Add a process to cgroup v2
+    fn add_process_v2(&self, pid: u32) -> Result<()> {
+        let procs_path = self.cgroup_path
+            .join(&self.group_name)
+            .join("cgroup.procs");
+            
+        let mut file = File::create(&procs_path)
+            .map_err(|e| anyhow!("Failed to open {} for writing: {}", procs_path.display(), e))?;
+            
+        write!(file, "{}", pid)
+            .map_err(|e| anyhow!("Failed to write PID {} to {}: {}", 
+                                  pid, procs_path.display(), e))?;
+                                  
+        info!("Added process {} to cgroup v2 {}", pid, self.group_name);
+        Ok(())
+    }
+    
+    /// Set CPU limits for the cgroup
+    pub fn set_cpu_limit(&self, cpu_quota: u64, cpu_period: u64) -> Result<()> {
+        if !self.created {
+            return Err(anyhow!("CGroup not created yet"));
+        }
+        
+        match self.version {
+            CgroupVersion::V1 => {
+                let quota_path = self.cgroup_path
+                    .join("cpu")
+                    .join(&self.group_name)
+                    .join("cpu.cfs_quota_us");
+                    
+                let period_path = self.cgroup_path
+                    .join("cpu")
+                    .join(&self.group_name)
+                    .join("cpu.cfs_period_us");
+                    
+                let mut quota_file = File::create(&quota_path)
+                    .map_err(|e| anyhow!("Failed to open {} for writing: {}", quota_path.display(), e))?;
+                    
+                let mut period_file = File::create(&period_path)
+                    .map_err(|e| anyhow!("Failed to open {} for writing: {}", period_path.display(), e))?;
+                    
+                write!(quota_file, "{}", cpu_quota)
+                    .map_err(|e| anyhow!("Failed to write quota: {}", e))?;
+                    
+                write!(period_file, "{}", cpu_period)
+                    .map_err(|e| anyhow!("Failed to write period: {}", e))?;
+            },
+            CgroupVersion::V2 => {
+                let max_path = self.cgroup_path
+                    .join(&self.group_name)
+                    .join("cpu.max");
+                    
+                let mut max_file = File::create(&max_path)
+                    .map_err(|e| anyhow!("Failed to open {} for writing: {}", max_path.display(), e))?;
+                    
+                write!(max_file, "{} {}", cpu_quota, cpu_period)
+                    .map_err(|e| anyhow!("Failed to write CPU max: {}", e))?;
+            },
+            CgroupVersion::None => return Err(anyhow!("CGroups not available on this system")),
+        }
+        
+        info!("Set CPU limit quota={} period={} for cgroup {}", 
+              cpu_quota, cpu_period, self.group_name);
+        Ok(())
+    }
+    
+    /// Set memory limit for the cgroup
+    pub fn set_memory_limit(&self, memory_bytes: u64) -> Result<()> {
+        if !self.created {
+            return Err(anyhow!("CGroup not created yet"));
+        }
+        
+        match self.version {
+            CgroupVersion::V1 => {
+                let limit_path = self.cgroup_path
+                    .join("memory")
+                    .join(&self.group_name)
+                    .join("memory.limit_in_bytes");
+                    
+                let mut limit_file = File::create(&limit_path)
+                    .map_err(|e| anyhow!("Failed to open {} for writing: {}", limit_path.display(), e))?;
+                    
+                write!(limit_file, "{}", memory_bytes)
+                    .map_err(|e| anyhow!("Failed to write memory limit: {}", e))?;
+            },
+            CgroupVersion::V2 => {
+                let max_path = self.cgroup_path
+                    .join(&self.group_name)
+                    .join("memory.max");
+                    
+                let mut max_file = File::create(&max_path)
+                    .map_err(|e| anyhow!("Failed to open {} for writing: {}", max_path.display(), e))?;
+                    
+                write!(max_file, "{}", memory_bytes)
+                    .map_err(|e| anyhow!("Failed to write memory max: {}", e))?;
+            },
+            CgroupVersion::None => return Err(anyhow!("CGroups not available on this system")),
+        }
+        
+        info!("Set memory limit {} bytes for cgroup {}", memory_bytes, self.group_name);
+        Ok(())
+    }
+    
+    /// Set process limit for the cgroup
+    pub fn set_pids_limit(&self, max_pids: u64) -> Result<()> {
+        if !self.created {
+            return Err(anyhow!("CGroup not created yet"));
+        }
+        
+        match self.version {
+            CgroupVersion::V1 => {
+                let limit_path = self.cgroup_path
+                    .join("pids")
+                    .join(&self.group_name)
+                    .join("pids.max");
+                    
+                let mut limit_file = File::create(&limit_path)
+                    .map_err(|e| anyhow!("Failed to open {} for writing: {}", limit_path.display(), e))?;
+                    
+                write!(limit_file, "{}", max_pids)
+                    .map_err(|e| anyhow!("Failed to write pids limit: {}", e))?;
+            },
+            CgroupVersion::V2 => {
+                let max_path = self.cgroup_path
+                    .join(&self.group_name)
+                    .join("pids.max");
+                    
+                let mut max_file = File::create(&max_path)
+                    .map_err(|e| anyhow!("Failed to open {} for writing: {}", max_path.display(), e))?;
+                    
+                write!(max_file, "{}", max_pids)
+                    .map_err(|e| anyhow!("Failed to write pids max: {}", e))?;
+            },
+            CgroupVersion::None => return Err(anyhow!("CGroups not available on this system")),
+        }
+        
+        info!("Set pids limit {} for cgroup {}", max_pids, self.group_name);
+        Ok(())
+    }
+    
+    /// Check if a process is in the cgroup
+    pub fn is_process_in_cgroup(&self, pid: u32) -> Result<bool> {
+        if !self.created {
+            return Ok(false);
+        }
+        
+        match self.version {
+            CgroupVersion::V1 => {
+                if self.subsystems.is_empty() {
+                    return Ok(false);
+                }
+                
+                // Use the first subsystem to check
+                let subsystem = self.subsystems[0];
+                let cgroup_file = PathBuf::from(format!("/proc/{}/cgroup", pid));
+                
+                if !cgroup_file.exists() {
+                    return Ok(false);
+                }
+                
+                let content = fs::read_to_string(cgroup_file)
+                    .map_err(|e| anyhow!("Failed to read /proc/{}/cgroup: {}", pid, e))?;
+                    
+                // Look for the subsystem in the cgroup file
+                for line in content.lines() {
+                    let parts: Vec<&str> = line.split(':').collect();
+                    if parts.len() >= 3 {
+                        let subsys = parts[1];
+                        let path = parts[2];
+                        
+                        if subsys.contains(subsystem.name_v1()) && 
+                           path.ends_with(&self.group_name) {
+                            return Ok(true);
+                        }
+                    }
+                }
+                
+                Ok(false)
+            },
+            CgroupVersion::V2 => {
+                let cgroup_file = PathBuf::from(format!("/proc/{}/cgroup", pid));
+                
+                if !cgroup_file.exists() {
+                    return Ok(false);
+                }
+                
+                let content = fs::read_to_string(cgroup_file)
+                    .map_err(|e| anyhow!("Failed to read /proc/{}/cgroup: {}", pid, e))?;
+                    
+                // In v2, there's only one line with the path
+                for line in content.lines() {
+                    let parts: Vec<&str> = line.split(':').collect();
+                    if parts.len() >= 3 {
+                        let path = parts[2];
+                        
+                        if path.ends_with(&self.group_name) {
+                            return Ok(true);
+                        }
+                    }
+                }
+                
+                Ok(false)
+            },
+            CgroupVersion::None => Ok(false),
+        }
+    }
+    
+    /// Get current CPU usage from the cgroup
+    pub fn get_cpu_usage(&self) -> Result<f64> {
+        if !self.created {
+            return Err(anyhow!("CGroup not created yet"));
+        }
+        
+        match self.version {
+            CgroupVersion::V1 => {
+                let usage_path = self.cgroup_path
+                    .join("cpu")
+                    .join(&self.group_name)
+                    .join("cpuacct.usage");
+                    
+                if !usage_path.exists() {
+                    return Ok(0.0);
+                }
+                
+                let content = fs::read_to_string(usage_path)
+                    .map_err(|e| anyhow!("Failed to read CPU usage: {}", e))?;
+                    
+                let usage = content.trim().parse::<u64>()
+                    .map_err(|e| anyhow!("Failed to parse CPU usage: {}", e))?;
+                    
+                // Convert to percentage (usage is in nanoseconds)
+                let cores = num_cpus::get() as f64;
+                let usage_sec = usage as f64 / 1_000_000_000.0;
+                
+                // This is a rough approximation, in reality you'd want to
+                // calculate the delta over time
+                Ok(usage_sec * 100.0 / cores)
+            },
+            CgroupVersion::V2 => {
+                let usage_path = self.cgroup_path
+                    .join(&self.group_name)
+                    .join("cpu.stat");
+                    
+                if !usage_path.exists() {
+                    return Ok(0.0);
+                }
+                
+                let content = fs::read_to_string(usage_path)
+                    .map_err(|e| anyhow!("Failed to read CPU stats: {}", e))?;
+                    
+                let mut usage = 0;
+                
+                for line in content.lines() {
+                    if line.starts_with("usage_usec") {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            usage = parts[1].parse::<u64>()
+                                .map_err(|e| anyhow!("Failed to parse CPU usage: {}", e))?;
+                            break;
+                        }
+                    }
+                }
+                
+                // Convert to percentage (usage is in microseconds)
+                let cores = num_cpus::get() as f64;
+                let usage_sec = usage as f64 / 1_000_000.0;
+                
+                // This is a rough approximation, in reality you'd want to
+                // calculate the delta over time
+                Ok(usage_sec * 100.0 / cores)
+            },
+            CgroupVersion::None => Ok(0.0),
+        }
+    }
+    
+    /// Get current memory usage from the cgroup
     pub fn get_memory_usage(&self) -> Result<u64> {
-        let usage = self.read_cgroup_file("memory.current")?;
-        usage.trim().parse::<u64>()
-            .map_err(|e| anyhow!("Failed to parse memory usage: {}", e))
+        if !self.created {
+            return Err(anyhow!("CGroup not created yet"));
+        }
+        
+        match self.version {
+            CgroupVersion::V1 => {
+                let usage_path = self.cgroup_path
+                    .join("memory")
+                    .join(&self.group_name)
+                    .join("memory.usage_in_bytes");
+                    
+                if !usage_path.exists() {
+                    return Ok(0);
+                }
+                
+                let content = fs::read_to_string(usage_path)
+                    .map_err(|e| anyhow!("Failed to read memory usage: {}", e))?;
+                    
+                content.trim().parse::<u64>()
+                    .map_err(|e| anyhow!("Failed to parse memory usage: {}", e))
+            },
+            CgroupVersion::V2 => {
+                let usage_path = self.cgroup_path
+                    .join(&self.group_name)
+                    .join("memory.current");
+                    
+                if !usage_path.exists() {
+                    return Ok(0);
+                }
+                
+                let content = fs::read_to_string(usage_path)
+                    .map_err(|e| anyhow!("Failed to read memory usage: {}", e))?;
+                    
+                content.trim().parse::<u64>()
+                    .map_err(|e| anyhow!("Failed to parse memory usage: {}", e))
+            },
+            CgroupVersion::None => Ok(0),
+        }
     }
-
-    /// Read current CPU usage
-    pub fn get_cpu_usage(&self) -> Result<String> {
-        self.read_cgroup_file("cpu.stat")
-    }
-
-    /// Read current IO usage
-    pub fn get_io_usage(&self) -> Result<String> {
-        self.read_cgroup_file("io.stat")
-    }
-
-    /// Remove the cgroup
-    pub fn remove(&self) -> Result<()> {
+    
+    /// Cleanup the cgroup on drop
+    fn cleanup(&self) -> Result<()> {
         if !self.created {
             return Ok(());
         }
-
-        // First make sure the cgroup is empty
-        self.write_cgroup_file("cgroup.procs", "0")?;
-
-        // Remove the cgroup directory
-        fs::remove_dir(&self.cgroup_path)
-            .with_context(|| format!("Failed to remove cgroup directory at {:?}", self.cgroup_path))?;
-
-        info!("Removed cgroup: {}", self.name);
+        
+        match self.version {
+            CgroupVersion::V1 => {
+                for subsystem in &self.subsystems {
+                    let subsys_path = self.cgroup_path
+                        .join(subsystem.name_v1())
+                        .join(&self.group_name);
+                        
+                    // First, move all processes to the root cgroup
+                    let tasks_path = subsys_path.join("tasks");
+                    if tasks_path.exists() {
+                        let content = fs::read_to_string(&tasks_path).unwrap_or_default();
+                        
+                        for pid in content.lines() {
+                            let root_tasks = self.cgroup_path
+                                .join(subsystem.name_v1())
+                                .join("tasks");
+                                
+                            let _ = fs::write(&root_tasks, pid);
+                        }
+                    }
+                    
+                    // Then remove the directory
+                    if subsys_path.exists() {
+                        let _ = fs::remove_dir(&subsys_path);
+                    }
+                }
+            },
+            CgroupVersion::V2 => {
+                let group_path = self.cgroup_path.join(&self.group_name);
+                
+                // First, move all processes to the root cgroup
+                let procs_path = group_path.join("cgroup.procs");
+                if procs_path.exists() {
+                    let content = fs::read_to_string(&procs_path).unwrap_or_default();
+                    
+                    for pid in content.lines() {
+                        let root_procs = self.cgroup_path.join("cgroup.procs");
+                        let _ = fs::write(&root_procs, pid);
+                    }
+                }
+                
+                // Then remove the directory
+                if group_path.exists() {
+                    let _ = fs::remove_dir(&group_path);
+                }
+            },
+            CgroupVersion::None => {},
+        }
+        
         Ok(())
     }
-
-    /// Write a value to a cgroup control file
-    fn write_cgroup_file(&self, control_file: &str, value: &str) -> Result<()> {
-        let path = self.cgroup_path.join(control_file);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("Failed to open cgroup control file {:?}", path))?;
-
-        file.write_all(value.as_bytes())
-            .with_context(|| format!("Failed to write to cgroup control file {:?}", path))?;
-
-        debug!("Wrote '{}' to cgroup file: {}", value, control_file);
+    
+    /// Apply resource limits defined in CgroupConfig to the cgroup
+    pub fn apply_limits(&self, config: &CgroupConfig) -> Result<()> {
+        if !self.created {
+            return Err(anyhow!("CGroup not created yet"));
+        }
+        
+        // Apply CPU limits if configured
+        if let Some(shares) = config.cpu_shares {
+            self.set_cpu_shares(shares)?;
+        }
+        
+        if let Some(quota) = config.cpu_quota_us {
+            if let Some(period) = config.cpu_period_us {
+                self.set_cpu_limit(period as u64, quota as u64)?;
+            }
+        }
+        
+        // Apply memory limits if configured
+        if let Some(mem_limit) = config.memory_limit_bytes {
+            self.set_memory_limit(mem_limit)?;
+        }
+        
+        // Apply PIDs limit if configured
+        if let Some(pids_max) = config.pids_max {
+            self.set_pids_limit(pids_max as u64)?;
+        }
+        
         Ok(())
     }
-
-    /// Read a value from a cgroup control file
-    fn read_cgroup_file(&self, control_file: &str) -> Result<String> {
-        let path = self.cgroup_path.join(control_file);
-        fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read cgroup control file {:?}", path))
+    
+    /// Set CPU shares (relative weight)
+    pub fn set_cpu_shares(&self, shares: u64) -> Result<()> {
+        if !self.created {
+            return Err(anyhow!("CGroup not created yet"));
+        }
+        
+        match self.version {
+            CgroupVersion::V1 => {
+                let cpu_shares_path = self.cgroup_path
+                    .join("cpu")
+                    .join(&self.group_name)
+                    .join("cpu.shares");
+                    
+                fs::write(cpu_shares_path, shares.to_string())
+                    .map_err(|e| anyhow!("Failed to set CPU shares: {}", e))?;
+            },
+            CgroupVersion::V2 => {
+                let cpu_weight_path = self.cgroup_path
+                    .join(&self.group_name)
+                    .join("cpu.weight");
+                    
+                // Convert from shares (1-1024) to weight (1-10000)
+                let weight = (shares * 10).min(10000);
+                
+                fs::write(cpu_weight_path, weight.to_string())
+                    .map_err(|e| anyhow!("Failed to set CPU weight: {}", e))?;
+            },
+            CgroupVersion::None => {},
+        }
+        
+        Ok(())
+    }
+    
+    /// Write to a cgroup control file
+    pub fn write_cgroup_file(&self, filename: &str, value: &str) -> Result<()> {
+        if !self.created {
+            return Err(anyhow!("CGroup not created yet"));
+        }
+        
+        match self.version {
+            CgroupVersion::V1 => {
+                // In v1, control files are in subsystem subdirectories
+                for subsystem in &self.subsystems {
+                    let file_path = self.cgroup_path
+                        .join(subsystem.name_v1())
+                        .join(&self.group_name)
+                        .join(filename);
+                        
+                    if file_path.exists() {
+                        fs::write(&file_path, value)
+                            .map_err(|e| anyhow!("Failed to write to {}: {}", file_path.display(), e))?;
+                        
+                        // For cgroup.subtree_control, this is likely only in one subsystem
+                        if filename == "cgroup.subtree_control" {
+                            break;
+                        }
+                    }
+                }
+            },
+            CgroupVersion::V2 => {
+                let file_path = self.cgroup_path
+                    .join(&self.group_name)
+                    .join(filename);
+                    
+                if file_path.exists() {
+                    fs::write(&file_path, value)
+                        .map_err(|e| anyhow!("Failed to write to {}: {}", file_path.display(), e))?;
+                }
+            },
+            CgroupVersion::None => {},
+        }
+        
+        Ok(())
     }
 }
 
 impl Drop for CgroupManager {
     fn drop(&mut self) {
-        if self.created {
-            if let Err(e) = self.remove() {
-                error!("Failed to remove cgroup on drop: {}", e);
-            }
-        }
+        let _ = self.cleanup();
     }
-}
-
-/// Check if cgroups v2 is available on the system
-fn is_cgroupv2_available() -> bool {
-    // Check if the system is using cgroups v2 (unified hierarchy)
-    if let Ok(out) = Command::new("mount")
-        .output() {
-            let output = String::from_utf8_lossy(&out.stdout);
-            output.contains("cgroup2") || output.contains("type cgroup2")
-        } else {
-            false
-        }
-}
-
-/// Get the cgroup v2 mount point
-fn get_cgroup_mount_point() -> Result<PathBuf> {
-    // First try standard locations
-    let standard_paths = [
-        "/sys/fs/cgroup",
-        "/mnt/cgroup",
-    ];
-
-    for path in &standard_paths {
-        let p = Path::new(path);
-        if p.exists() && fs::metadata(p)?.is_dir() {
-            return Ok(p.to_path_buf());
-        }
-    }
-
-    // Try to find it from mount output
-    if let Ok(out) = Command::new("mount")
-        .output() {
-            let output = String::from_utf8_lossy(&out.stdout);
-            for line in output.lines() {
-                if line.contains("cgroup2") || line.contains("type cgroup2") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 3 {
-                        let mount_point = parts[2];
-                        return Ok(PathBuf::from(mount_point));
-                    }
-                }
-            }
-        }
-
-    Err(anyhow!("Could not determine cgroup v2 mount point"))
 }
 
 /// Create a sandbox-ready cgroup with appropriate permissions
